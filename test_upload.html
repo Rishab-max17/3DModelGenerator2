@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>2D to 3D Model Generator Test</title>
+</head>
+<body>
+  <h1>Upload Image for 3D Model Generation</h1>
+  
+  <h2>Basic Generation</h2>
+  <form action="http://localhost:8000/generate" method="post" enctype="multipart/form-data">
+    <div>
+      <label for="file">Select image:</label>
+      <input type="file" id="file" name="file" accept="image/*">
+    </div>
+    <div>
+      <label for="resolution">Resolution:</label>
+      <input type="number" id="resolution" name="resolution" value="256">
+    </div>
+    <div>
+      <label for="use_high_quality">High quality:</label>
+      <input type="checkbox" id="use_high_quality" name="use_high_quality">
+    </div>
+    <div>
+      <label for="format">Format:</label>
+      <select id="format" name="format">
+        <option value="glb">GLB</option>
+        <option value="obj">OBJ</option>
+      </select>
+    </div>
+    <button type="submit">Generate 3D Model</button>
+  </form>
+  
+  <h2>Generation with Text Prompt</h2>
+  <form action="http://localhost:8000/generate-with-prompt" method="post" enctype="multipart/form-data">
+    <div>
+      <label for="file">Select image:</label>
+      <input type="file" id="file" name="file" accept="image/*">
+    </div>
+    <div>
+      <label for="prompt">Text prompt:</label>
+      <input type="text" id="prompt" name="prompt" value="A detailed 3D sculpture">
+    </div>
+    <div>
+      <label for="resolution">Resolution:</label>
+      <input type="number" id="resolution" name="resolution" value="256">
+    </div>
+    <div>
+      <label for="format">Format:</label>
+      <select id="format" name="format">
+        <option value="glb">GLB</option>
+        <option value="obj">OBJ</option>
+      </select>
+    </div>
+    <button type="submit">Generate 3D Model with Prompt</button>
+  </form>
+</body>
+</html> 
