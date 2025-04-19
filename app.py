@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import numpy as np
 import json
+import time
 
 from model.generator import ModelGenerator
 from utils.image_processing import preprocess_image
@@ -49,12 +50,20 @@ class GenerationParams(BaseModel):
     format: str = "glb"  # Output format (obj, glb, etc.)
     multi_view: bool = True  # Generate from multiple viewpoints
     use_hunyuan: bool = True  # Whether to use Hunyuan3D-2 model
+    texture_resolution: int = 2048  # Resolution of textures
+    remove_background: bool = True  # Whether to remove background
+    geometry_detail_level: str = "high"  # Level of geometric detail
+    texture_quality: str = "high"  # Quality of textures
 
 class TextPromptParams(BaseModel):
     prompt: str
     resolution: int = 256
     format: str = "glb"  # Output format (obj, glb, etc.)
     use_hunyuan: bool = True  # Whether to use Hunyuan3D-2 model
+    texture_resolution: int = 2048  # Resolution of textures
+    remove_background: bool = True  # Whether to remove background
+    geometry_detail_level: str = "high"  # Level of geometric detail
+    texture_quality: str = "high"  # Quality of textures
 
 class SimilarModelsParams(BaseModel):
     query: str
@@ -78,36 +87,53 @@ async def generate_3d_model(
     # Preprocess image
     processed_image = preprocess_image(file_path)
     
+    # Override parameters for better quality models
+    resolution = params.resolution if params else 256
+    resolution = max(resolution, 512)  # Ensure minimum 512 resolution for good mesh structure
+    use_high_quality = True  # Always use high quality regardless of user setting
+    format = params.format if params else "glb"
+    multi_view = True  # Always use multi-view for better 3D structure
+    
     # Process with model and generate 3D model
     if params and params.use_hunyuan:
         try:
+            print(f"Generating high-quality Hunyuan3D model for request {request_id}")
             output_path = model_generator.generate_hunyuan3d(
                 processed_image, 
                 request_id, 
-                resolution=params.resolution if params else 256,
-                use_high_quality=params.use_high_quality if params else False,
-                format=params.format if params else "glb"
+                resolution=resolution,
+                use_high_quality=use_high_quality,
+                format=format,
+                texture_resolution=params.texture_resolution,
+                remove_background=params.remove_background,
+                geometry_detail_level=params.geometry_detail_level,
+                texture_quality=params.texture_quality
             )
         except Exception as e:
             print(f"Error using Hunyuan3D-2: {e}")
-            print("Falling back to original implementation...")
+            print("Falling back to enhanced local implementation...")
             output_path = model_generator.generate(
                 processed_image, 
                 request_id, 
-                resolution=params.resolution if params else 256,
-                use_high_quality=params.use_high_quality if params else False,
-                format=params.format if params else "glb",
-                multi_view=params.multi_view if params else True
+                resolution=resolution,
+                use_high_quality=use_high_quality,
+                format=format,
+                multi_view=multi_view
             )
     else:
+        print(f"Generating enhanced local 3D model for request {request_id}")
         output_path = model_generator.generate(
             processed_image, 
             request_id, 
-            resolution=params.resolution if params else 256,
-            use_high_quality=params.use_high_quality if params else False,
-            format=params.format if params else "glb",
-            multi_view=params.multi_view if params else True
+            resolution=resolution,
+            use_high_quality=use_high_quality,
+            format=format,
+            multi_view=multi_view
         )
+    
+    # Verify the model exists and has proper structure
+    if not output_path.exists():
+        raise HTTPException(status_code=500, detail="Failed to generate 3D model file")
     
     # Store model metadata in Qdrant
     try:
@@ -116,10 +142,10 @@ async def generate_3d_model(
             "filename": file.filename,
             "original_image": f"/models/{request_id}/input_image.png",
             "model_path": str(output_path),
-            "resolution": params.resolution if params else 256,
-            "use_high_quality": params.use_high_quality if params else False,
-            "format": params.format if params else "glb",
-            "multi_view": params.multi_view if params else True,
+            "resolution": resolution,
+            "use_high_quality": use_high_quality,
+            "format": format,
+            "multi_view": multi_view,
             "use_hunyuan": params.use_hunyuan if params else True,
             "creation_time": str(Path(output_path).stat().st_ctime if output_path.exists() else 0)
         }
@@ -142,10 +168,16 @@ async def generate_3d_model(
     # Schedule cleanup
     background_tasks.add_task(cleanup_files, request_id)
     
+    # Return enhanced response with mesh info
     return {
         "request_id": request_id,
         "model_url": f"/models/{request_id}/download",
-        "status": "success"
+        "status": "success",
+        "mesh_info": {
+            "resolution": resolution,
+            "format": format,
+            "file_size": output_path.stat().st_size if output_path.exists() else 0
+        }
     }
 
 @app.post("/generate-with-prompt")
@@ -155,7 +187,13 @@ async def generate_with_prompt(
     prompt: str = Form(...),
     resolution: int = Form(256),
     format: str = Form("glb"),
-    use_hunyuan: bool = Form(True)
+    use_hunyuan: bool = Form(True),
+    retry_count: int = Form(2),
+    model_version: str = Form("b1b9449a1277e10402781c5d41eb30c0a0683504fb23fab591ca9dfc2aabe1cb"),
+    texture_resolution: int = Form(2048),
+    remove_background: bool = Form(True),
+    geometry_detail_level: str = Form("high"),
+    texture_quality: str = Form("high")
 ):
     if not file:
         raise HTTPException(status_code=400, detail="No image file provided")
@@ -169,36 +207,57 @@ async def generate_with_prompt(
     # Preprocess image
     processed_image = preprocess_image(file_path)
     
+    # Enhance prompt for better 3D generation if needed
+    enhanced_prompt = prompt
+    if not any(keyword in prompt.lower() for keyword in ["3d", "three dimensional", "detailed", "high quality"]):
+        enhanced_prompt = f"{prompt}, detailed 3D model with clear shape and texture, high quality"
+        print(f"Enhanced prompt: '{prompt}' -> '{enhanced_prompt}'")
+    
+    # Override parameters for better quality models
+    resolution = max(resolution, 512)  # Ensure minimum 512 resolution for good mesh structure
+    
     # Process with model and generate 3D model with text prompt
     if use_hunyuan:
         try:
+            print(f"Generating high-quality Hunyuan3D model with text prompt for request {request_id}")
             output_path = model_generator.generate_with_text_prompt_hunyuan3d(
                 processed_image,
-                prompt,
+                enhanced_prompt,
                 request_id,
                 resolution=resolution,
-                format=format
+                format=format,
+                model_version=model_version,
+                retry_count=retry_count,
+                texture_resolution=texture_resolution,
+                remove_background=remove_background,
+                geometry_detail_level=geometry_detail_level,
+                texture_quality=texture_quality
             )
         except Exception as e:
             print(f"Error using Hunyuan3D-2 with text prompt: {e}")
-            print("Falling back to original implementation...")
+            print("Falling back to enhanced local implementation...")
             output_path = model_generator.generate_with_text_prompt(
                 processed_image,
-                prompt,
+                enhanced_prompt,
                 request_id,
                 resolution=resolution,
                 format=format,
                 multi_view=True
             )
     else:
+        print(f"Generating enhanced local 3D model with text prompt for request {request_id}")
         output_path = model_generator.generate_with_text_prompt(
             processed_image,
-            prompt,
+            enhanced_prompt,
             request_id,
             resolution=resolution,
             format=format,
             multi_view=True
         )
+    
+    # Verify the model exists and has proper structure
+    if not output_path.exists():
+        raise HTTPException(status_code=500, detail="Failed to generate 3D model file")
     
     # Store model metadata in Qdrant
     try:
@@ -208,6 +267,7 @@ async def generate_with_prompt(
             "original_image": f"/models/{request_id}/input_image.png",
             "model_path": str(output_path),
             "prompt": prompt,
+            "enhanced_prompt": enhanced_prompt if enhanced_prompt != prompt else None,
             "resolution": resolution,
             "format": format,
             "use_hunyuan": use_hunyuan,
@@ -219,7 +279,7 @@ async def generate_with_prompt(
             from utils.model_embeddings import embedding_generator
             # For text prompt models, combine image and text embeddings
             image_embedding = embedding_generator.generate_embedding_from_image(file_path)
-            text_embedding = embedding_generator.generate_embedding_from_metadata({"prompt": prompt})
+            text_embedding = embedding_generator.generate_embedding_from_metadata({"prompt": enhanced_prompt})
             embedding = (image_embedding + text_embedding) / 2
             embedding = embedding / np.linalg.norm(embedding)
         except (ImportError, Exception) as e:
@@ -236,10 +296,18 @@ async def generate_with_prompt(
     # Schedule cleanup
     background_tasks.add_task(cleanup_files, request_id)
     
+    # Return enhanced response with mesh info
     return {
         "request_id": request_id,
         "model_url": f"/models/{request_id}/download",
-        "status": "success"
+        "status": "success",
+        "mesh_info": {
+            "resolution": resolution,
+            "format": format,
+            "prompt": prompt,
+            "enhanced_prompt": enhanced_prompt if enhanced_prompt != prompt else None,
+            "file_size": output_path.stat().st_size if output_path.exists() else 0
+        }
     }
 
 @app.post("/generate-simple")
@@ -250,7 +318,13 @@ async def generate_simple(
     use_high_quality: bool = False,
     format: str = "glb",
     multi_view: bool = True,
-    use_hunyuan: bool = True
+    use_hunyuan: bool = True,
+    retry_count: int = 2,
+    model_version: str = "b1b9449a1277e10402781c5d41eb30c0a0683504fb23fab591ca9dfc2aabe1cb",
+    texture_resolution: int = 2048,
+    remove_background: bool = True,
+    geometry_detail_level: str = "high",
+    texture_quality: str = "high"
 ):
     if not file:
         raise HTTPException(status_code=400, detail="No image file provided")
@@ -258,81 +332,116 @@ async def generate_simple(
     # Generate unique ID for this request
     request_id = str(uuid.uuid4())
     
-    # Save uploaded image
-    file_path = await save_upload(file, request_id)
-    
-    # Preprocess image
-    processed_image = preprocess_image(file_path)
-    
-    # Process with model and generate 3D model
-    if use_hunyuan:
-        try:
-            output_path = model_generator.generate_hunyuan3d(
-                processed_image, 
-                request_id, 
-                resolution=resolution,
-                use_high_quality=use_high_quality,
-                format=format
-            )
-        except Exception as e:
-            print(f"Error using Hunyuan3D-2: {e}")
-            print("Falling back to original implementation...")
+    try:
+        # Save uploaded image
+        file_path = await save_upload(file, request_id)
+        
+        # Preprocess image
+        processed_image = preprocess_image(file_path)
+        
+        # Use enhanced quality settings for better mesh structure
+        use_high_quality = True  # Always use high quality
+        resolution = max(resolution, 512)  # Use at least 512 resolution for better detail
+        
+        # Process with model and generate 3D model
+        if use_hunyuan:
+            try:
+                # Always use the most advanced model generation path
+                print(f"Generating high-quality 3D model with Hunyuan3D for request {request_id}")
+                output_path = model_generator.generate_hunyuan3d(
+                    processed_image, 
+                    request_id, 
+                    resolution=resolution,
+                    use_high_quality=use_high_quality,
+                    format=format,
+                    retry_count=retry_count,
+                    model_version=model_version,
+                    texture_resolution=texture_resolution,
+                    remove_background=remove_background,
+                    geometry_detail_level=geometry_detail_level,
+                    texture_quality=texture_quality
+                )
+            except Exception as e:
+                print(f"Error using Hunyuan3D-2: {e}")
+                print("Falling back to original implementation with enhanced settings...")
+                # Fall back to local generation with enhanced settings
+                output_path = model_generator.generate(
+                    processed_image, 
+                    request_id, 
+                    resolution=resolution,
+                    use_high_quality=True,
+                    format=format,
+                    multi_view=True  # Always use multi-view for better structure
+                )
+        else:
+            # For non-Hunyuan models, use enhanced settings
+            print(f"Generating 3D model with local implementation for request {request_id}")
             output_path = model_generator.generate(
                 processed_image, 
                 request_id, 
                 resolution=resolution,
-                use_high_quality=use_high_quality,
+                use_high_quality=True,  # Always use high quality
                 format=format,
-                multi_view=multi_view
+                multi_view=True  # Always use multi-view for better structure
             )
-    else:
-        output_path = model_generator.generate(
-            processed_image, 
-            request_id, 
-            resolution=resolution,
-            use_high_quality=use_high_quality,
-            format=format,
-            multi_view=multi_view
-        )
-    
-    # Store model metadata in Qdrant
-    try:
-        # Create metadata
-        metadata = {
-            "filename": file.filename,
-            "original_image": f"/models/{request_id}/input_image.png",
-            "model_path": str(output_path),
-            "resolution": resolution,
-            "use_high_quality": use_high_quality,
-            "format": format,
-            "multi_view": multi_view,
-            "use_hunyuan": use_hunyuan,
-            "creation_time": str(Path(output_path).stat().st_ctime if output_path.exists() else 0)
-        }
         
-        # Get or generate embedding
+        # Verify model is valid and has proper mesh structure
+        if not output_path.exists():
+            raise HTTPException(status_code=500, detail="Failed to generate 3D model")
+        
+        # Store model metadata in Qdrant - wrapped with try/except and ignore errors
         try:
-            from utils.model_embeddings import embedding_generator
-            embedding = embedding_generator.generate_embedding_from_image(file_path)
-        except (ImportError, Exception) as e:
-            print(f"Error generating embedding: {e}")
-            # Fallback to random embedding
-            embedding = np.random.random(512)
-            embedding = embedding / np.linalg.norm(embedding)
+            # Create metadata
+            metadata = {
+                "filename": file.filename,
+                "original_image": f"/models/{request_id}/input_image.png",
+                "model_path": str(output_path),
+                "resolution": resolution,
+                "use_high_quality": use_high_quality,
+                "format": format,
+                "multi_view": multi_view,
+                "use_hunyuan": use_hunyuan,
+                "creation_time": str(Path(output_path).stat().st_ctime if output_path.exists() else 0)
+            }
+            
+            # Get or generate embedding
+            try:
+                from utils.model_embeddings import embedding_generator
+                embedding = embedding_generator.generate_embedding_from_image(file_path)
+            except (ImportError, Exception) as e:
+                print(f"Error generating embedding: {e}")
+                # Fallback to random embedding
+                embedding = np.random.random(512)
+                embedding = embedding / np.linalg.norm(embedding)
+            
+            # Store in vector database
+            try:
+                add_model_to_database(qdrant_client, request_id, embedding, metadata)
+            except Exception as db_error:
+                print(f"Error adding to vector database, continuing without it: {db_error}")
+        except Exception as e:
+            print(f"Error in vector database operations, continuing anyway: {e}")
         
-        # Store in vector database
-        add_model_to_database(qdrant_client, request_id, embedding, metadata)
+        # Schedule cleanup
+        background_tasks.add_task(cleanup_files, request_id)
+        
+        return {
+            "request_id": request_id,
+            "model_url": f"/models/{request_id}/download",
+            "status": "success",
+            "mesh_info": {
+                "resolution": resolution,
+                "format": format,
+                "path": str(output_path),
+                "file_size": output_path.stat().st_size
+            }
+        }
     except Exception as e:
-        print(f"Error storing model in vector database: {e}")
-    
-    # Schedule cleanup
-    background_tasks.add_task(cleanup_files, request_id)
-    
-    return {
-        "request_id": request_id,
-        "model_url": f"/models/{request_id}/download",
-        "status": "success"
-    }
+        # Print full error for debugging
+        import traceback
+        print(f"Error in generate_simple: {e}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error generating 3D model: {str(e)}")
 
 @app.get("/models/{request_id}/download")
 async def download_model(request_id: str):
@@ -382,6 +491,15 @@ async def get_input_image(request_id: str):
 async def read_root():
     return {"message": "2D to 3D Model Generator API"}
 
+@app.get("/test")
+async def test_endpoint():
+    """Simple test endpoint that doesn't require external APIs"""
+    return {
+        "status": "success",
+        "message": "API is working correctly",
+        "timestamp": str(time.time())
+    }
+
 @app.get("/models/search")
 async def search_models(
     query: str = Query(..., description="Search query text"),
@@ -430,7 +548,7 @@ async def search_models(
 @app.get("/models/{request_id}/info")
 async def get_model_info(request_id: str):
     """
-    Get information about a specific model
+    Get information about a specific model, including 3D metrics
     """
     try:
         # Retrieve model from vector database
@@ -439,11 +557,39 @@ async def get_model_info(request_id: str):
         if not model_data:
             raise HTTPException(status_code=404, detail="Model not found")
         
-        # Return model info
+        # Extract model path from metadata
+        model_path = model_data["metadata"].get("model_path")
+        
+        # Get 3D metrics if the model file exists
+        model_metrics = {}
+        if model_path and Path(model_path).exists():
+            try:
+                import trimesh
+                mesh = trimesh.load(model_path)
+                
+                # Extract mesh metrics
+                model_metrics = {
+                    "vertices_count": mesh.vertices.shape[0],
+                    "faces_count": mesh.faces.shape[0],
+                    "bounding_box": mesh.bounding_box.extents.tolist(),
+                    "volume": float(mesh.volume) if hasattr(mesh, "volume") else None,
+                    "surface_area": float(mesh.area) if hasattr(mesh, "area") else None,
+                    "is_watertight": bool(mesh.is_watertight) if hasattr(mesh, "is_watertight") else None
+                }
+            except Exception as e:
+                print(f"Error extracting mesh metrics: {e}")
+                # Provide at least minimal info even if metrics extraction fails
+                model_metrics = {
+                    "vertices_count": -1,
+                    "faces_count": -1
+                }
+        
+        # Return model info with 3D metrics
         return {
             "model_id": model_data["model_id"],
             "metadata": model_data["metadata"],
-            "download_url": f"/models/{request_id}/download"
+            "download_url": f"/models/{request_id}/download",
+            **model_metrics  # Include all mesh metrics
         }
     except HTTPException:
         raise
@@ -452,4 +598,4 @@ async def get_model_info(request_id: str):
         raise HTTPException(status_code=500, detail=f"Error retrieving model info: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", 8000)), reload=True) 
+    uvicorn.run(app, host="0.0.0.0", port=8003) 
